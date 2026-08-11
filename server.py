@@ -5,6 +5,7 @@ Responsibilities:
   - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
   - Management API at /setup/api/* (config, status, logs, gateway, pairing)
   - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
+  - WebSocket reverse proxy → native Hermes dashboard (for /api/pty, /api/ws, etc.)
   - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
   - Cookie-based session auth at /login (HMAC-signed, 7-day expiry, httponly)
 
@@ -33,6 +34,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import websockets
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import (
@@ -42,8 +44,10 @@ from starlette.responses import (
     Response,
     StreamingResponse,
 )
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
+from starlette.websockets import WebSocket, WebSocketDisconnect
+from websockets.exceptions import InvalidHandshake, InvalidStatus
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -57,6 +61,7 @@ PAIRING_TTL = 3600
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+HERMES_DASHBOARD_WS_URL = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 
 # Our public listen port (Railway injects $PORT; some templates set it to 8642,
 # which is also hermes' API-server default — see the collision guard below).
@@ -88,6 +93,15 @@ API_SERVER_URL = f"http://127.0.0.1:{API_SERVER_PORT}"
 # some hermes endpoints read it. Aggressive stripping was masking requests in
 # ways that produced spurious 401s.
 HOP_BY_HOP = {"host", "transfer-encoding"}
+
+# WebSocket handshake headers we must NOT forward upstream: the `websockets`
+# client library sets Host itself, and the rest are negotiated by the WS
+# handshake (sending them verbatim would either be ignored or break the upgrade).
+WS_HOP_BY_HOP = {
+    "host", "upgrade", "connection",
+    "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+    "sec-websocket-accept",
+}
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -1184,6 +1198,123 @@ async def route_api(request: Request) -> Response:
     return await _proxy_to_api(request)
 
 
+async def _ws_forward_client_to_upstream(websocket: WebSocket, upstream) -> None:
+    """Pump messages from the browser WebSocket into the dashboard WebSocket."""
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message.get("text") is not None:
+                await upstream.send(message["text"])
+            elif message.get("bytes") is not None:
+                await upstream.send(message["bytes"])
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[ws-proxy] client->upstream error: {e!r}", flush=True)
+
+
+async def _ws_forward_upstream_to_client(upstream, websocket: WebSocket) -> None:
+    """Pump messages from the dashboard WebSocket back to the browser."""
+    try:
+        async for message in upstream:
+            if isinstance(message, str):
+                await websocket.send_text(message)
+            else:
+                await websocket.send_bytes(message)
+    except Exception as e:
+        print(f"[ws-proxy] upstream->client error: {e!r}", flush=True)
+
+
+async def _proxy_websocket(websocket: WebSocket) -> None:
+    """Bidirectionally forward a WebSocket connection to the Hermes dashboard.
+
+    The Hermes Chat tab opens two WebSockets: /api/pty (PTY terminal stream)
+    and /api/ws (JSON-RPC sidecar for the chat session). Both go through
+    Railway's edge proxy → server.py → hermes dashboard on 127.0.0.1:9119.
+
+    Auth model: the dashboard enforces its own WebSocket auth using the
+    session-token cookie it sets during login. The browser sends that cookie
+    in the WS upgrade request; we forward it to the dashboard, which validates
+    it. We do NOT enforce our admin cookie here — the dashboard's auth is
+    sufficient (matches the spirit of the SPA's per-endpoint auth model).
+
+    Idle-connection handling: uvicorn's ws_ping_interval sends periodic pings
+    on the public (browser ↔ server.py) leg so Railway's edge proxy doesn't
+    drop the connection with code 1006 after ~30-60s of silence.
+    """
+    path = websocket.url.path
+    qs = websocket.url.query
+    upstream_url = f"{HERMES_DASHBOARD_WS_URL}{path}"
+    if qs:
+        upstream_url = f"{upstream_url}?{qs}"
+
+    # Forward the headers the dashboard needs (notably `cookie` for its session
+    # auth, plus `origin` if it does origin checks). Drop WS-handshake headers
+    # and Host — the websockets library will set those for the loopback connect.
+    forward_headers = [
+        (k, v) for k, v in websocket.headers.items()
+        if k.lower() not in WS_HOP_BY_HOP
+    ]
+
+    await websocket.accept()
+
+    try:
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=forward_headers,
+            open_timeout=10,
+            # Mirror the uvicorn pings on the upstream leg so an idle
+            # loopback socket also gets cleaned up promptly.
+            ping_interval=20,
+            ping_timeout=20,
+        ) as upstream:
+            client_to_upstream_task = asyncio.create_task(
+                _ws_forward_client_to_upstream(websocket, upstream)
+            )
+            upstream_to_client_task = asyncio.create_task(
+                _ws_forward_upstream_to_client(upstream, websocket)
+            )
+
+            # When either direction finishes (clean close, disconnect, or
+            # error), cancel the other and let it unwind.
+            done, pending = await asyncio.wait(
+                {client_to_upstream_task, upstream_to_client_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                # Surface unexpected exceptions to the Railway log; clean
+                # disconnects (WebSocketDisconnect, ConnectionClosed) are
+                # already swallowed inside the helpers.
+                if exc := task.exception():
+                    print(f"[ws-proxy] {path} task error: {exc!r}", flush=True)
+    except (InvalidStatus, InvalidHandshake) as e:
+        # Dashboard is down or refused the upgrade (e.g. 401/502/503).
+        # Tell the browser something useful so the UI doesn't spin forever
+        # on a "starting up" reconnect loop.
+        print(f"[ws-proxy] upstream handshake failed for {path}: {e!r}", flush=True)
+        try:
+            await websocket.close(code=1011, reason="Upstream unavailable")
+        except Exception:
+            pass
+    except OSError as e:
+        # Connect refused / loopback unreachable.
+        print(f"[ws-proxy] cannot reach dashboard for {path}: {e!r}", flush=True)
+        try:
+            await websocket.close(code=1011, reason="Dashboard unreachable")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[ws-proxy] unexpected error for {path}: {e!r}", flush=True)
+        try:
+            await websocket.close(code=1011, reason="Proxy error")
+        except Exception:
+            pass
+
+
 async def route_root(request: Request) -> Response:
     """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
 
@@ -1287,6 +1418,13 @@ routes = [
 
     # Catch-all: everything else proxies to the Hermes dashboard subprocess.
     Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
+
+    # WebSocket reverse proxy → Hermes dashboard.
+    # The Chat tab opens /api/pty (terminal) and /api/ws (JSON-RPC sidecar);
+    # the catch-all covers any other WS endpoints the dashboard exposes.
+    WebSocketRoute("/api/pty",                  _proxy_websocket),
+    WebSocketRoute("/api/ws",                   _proxy_websocket),
+    WebSocketRoute("/{path:path}",              _proxy_websocket),
 ]
 
 # No middleware — auth is enforced per-handler via guard(). This keeps /health
@@ -1298,7 +1436,16 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio")
+    # Railway's edge proxy drops idle WebSocket connections after ~30-60s with
+    # close code 1006. uvicorn's ws_ping_interval sends a ping every N seconds
+    # on the browser↔server.py leg so both ends keep the connection marked
+    # active. timeout_keep_alive covers the non-WS HTTP case.
+    config = uvicorn.Config(
+        app, host="0.0.0.0", port=port, log_level="info", loop="asyncio",
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        timeout_keep_alive=60,
+    )
     server = uvicorn.Server(config)
 
     def _shutdown():
